@@ -74,10 +74,9 @@ class ConnectionManager {
             setTimeout(async () => {
                 if (this.isDestroyed) return;
                 try {
-                    const code = await this.conn.requestPairingCode(
-                        this.phone.replace(/[^0-9]/g, '')
-                    );
-                    this.socket.emit('code', code);
+                    
+          const code = await this.conn.requestPairingCode(this.phone.replace(/[^0-9]/g, ''));
+             this.socket.emit('code', code);
                 } catch (err) {
                     console.error('Pair code error:', err.message);
                     this.socket.emit('error', 'Pair code request failed. Try again.');
