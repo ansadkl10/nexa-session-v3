@@ -1,0 +1,19 @@
+name: nexa-md-session
+services:
+  - name: session-web
+    type: web
+    git:
+      branch: main
+    build:
+      buildpack: nodejs
+      run_command: npm run build
+    run:
+      command: npm start
+    ports:
+      - port: 3000
+        protocol: http
+    env:
+      - key: NODE_ENV
+        value: production
+      - key: OWNER_NUMBER
+        value: "916235508514"
